@@ -1,0 +1,10 @@
+# 로컬 LLM 및 평가 의존성 (외부 API 금지에 따른 자체 추론)
+# - llama-cpp-python: GGUF 로더 (Qwen/Mistral/Gemma 호환, torch 비의존)
+# - bert-score:       BERTScore 평가 (Generation 30%)
+# - fastembed:        ONNX 기반 dense 임베딩 (torch 비의존, GPU 가능)
+# - kiwipiepy:        한국어 형태소 분석 (BM25 토크나이저 향상)
+llama-cpp-python>=0.3.0
+bert-score>=0.3.13
+fastembed>=0.6.0
+kiwipiepy>=0.20.0
+onnxruntime-gpu>=1.20.0

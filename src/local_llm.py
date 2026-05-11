@@ -1,0 +1,294 @@
+"""
+로컬 LLM 호출 모듈 (외부 API 금지 — 공정위 트랙2 요건)
+
+기본 백엔드: llama-cpp-python (GGUF 로더; Llama 모델이 아니라 임의 GGUF 로딩)
+권장 모델 : Qwen2.5-7B-Instruct (Q4_K_M GGUF, 한국어 성능 ↑)
+대안       : Mistral-7B-Instruct, Gemma-2-7B-Instruct
+금지       : Llama 시리즈 (사용자 정책)
+
+응답 시간 제약: 공모전 30초 — 그 이하로 답변 마칠 수 있도록 토큰 수·temperature
+                        조정.
+
+환경변수:
+    LLM_GGUF_PATH      GGUF 모델 파일 경로 (필수)
+    LLM_N_CTX          context window (기본 4096)
+    LLM_N_THREADS      CPU 스레드 (기본 자동)
+    LLM_MAX_TOKENS     생성 토큰 상한 (기본 800)
+    LLM_TEMPERATURE    sampling temp (기본 0.2)
+"""
+
+from __future__ import annotations
+
+import os
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+
+
+# ───────────────────────── CUDA DLL 경로 보강 (Windows) ─────────────────────────
+# llama-cpp-python CUDA wheel 은 cudart64_12.dll, cublas64_12.dll 등을 시스템에서
+# 찾는다. nvidia-cuda-runtime-cu12 / nvidia-cublas-cu12 pip 패키지가 이 DLL 들을
+# site-packages/nvidia/.../bin 에 둔다.
+#
+# llama_cpp/_ctypes_extensions.py 가 winmode=RTLD_GLOBAL 로 로드하므로
+# add_dll_directory 가 의존성 DLL 검색에 적용되지 않는다.
+# PATH 환경변수에 nvidia bin 들을 prepend 해야 작동.
+def _add_nvidia_dll_dirs() -> None:
+    if os.name != "nt":
+        return
+    try:
+        import importlib.util
+        added = []
+        for sub in ("nvidia.cuda_runtime", "nvidia.cublas", "nvidia.cuda_nvrtc"):
+            spec = importlib.util.find_spec(sub)
+            if spec is None or not spec.submodule_search_locations:
+                continue
+            base = Path(list(spec.submodule_search_locations)[0])
+            binp = base / "bin"
+            if binp.exists():
+                os.add_dll_directory(str(binp))   # 보조
+                added.append(str(binp))
+        if added:
+            os.environ["PATH"] = os.pathsep.join(added) + os.pathsep + os.environ.get("PATH", "")
+    except Exception:
+        pass
+
+_add_nvidia_dll_dirs()
+
+
+SYSTEM_PROMPT = """당신은 공정거래위원회 의결서 발췌기다. 반드시 한국어로만 답변한다.
+
+규칙:
+1. **답변은 오직 [참고 의결서] 본문에서만 발췌·인용**한다. 본문 외 사실 추측·창작 금지.
+2. **우선순위: 같은 사건의 "주문/처분/결론" 본문**을 먼저 발췌하고,
+   필요하면 "위법성판단/기초사실" 본문을 보충한다.
+3. 답변에 다음을 가능한 모두 포함 (모두 [참고 의결서] 본문 발췌로):
+   - 위반 행위 요지
+   - 적용 법조항 (예: 법 제○조 제○항)
+   - 처분 내용 (시정명령 / 과징금 / 고발 / 과징금 액수)
+4. 답변은 첫 번째로 등장하는 의결서(가장 관련 있는 사건)에 집중. 다른 의결서로 헷갈리지 않는다.
+5. 답변 본문 800자 이내. 발췌 길게 — 위반행위·법조항·처분 모두 포함. 마지막 줄에 "[의결서: 사건명]" 1회 인용.
+6. 영어·중국어·일본어 절대 금지. 100% 한국어.
+7. **[참고 의결서]에서 질문에 대한 명확한 근거를 찾을 수 없으면**
+   "관련 의결서에서 확인되지 않습니다" 한 줄만 출력. 추측·일반론 금지.
+"""
+
+# 모델 우선순위 (사용자 정책: Qwen2.5-7B-Instruct 우선)
+_PREFERRED_MODEL_PATTERNS = [
+    "qwen2.5",   # Qwen2.5 7B 우선 (사용자 지정)
+    "qwen",      # Qwen 계열 일반
+    "exaone",    # 한국어 SOTA backup
+    "mistral",
+    "gemma",
+]
+
+USER_PROMPT_TEMPLATE = """질문: {query}
+
+[참고 의결서]
+{context}
+
+가장 관련 있는 의결서의 "주문/처분/결론" 본문에서 다음을 원문 그대로 발췌:
+- 위반행위 요지 (피심인이 무엇을 했는가)
+- 적용 법조항 (법 제○조 제○항)
+- 처분 내용 (시정명령/과징금 액수/고발 등)
+한국어로 800자 이내로 답하되, 가능한 한 본문 표현을 길게 인용하십시오. 의역 금지.
+"""
+
+
+def format_context(hits: list, max_text_chars: int = 350) -> str:
+    """
+    LLM 컨텍스트 빌드. 각 청크 본문을 max_text_chars 로 잘라 컨텍스트 윈도우 보호.
+    공식 데이터의 일부 청크는 매우 길어 5개를 합치면 4096 토큰을 넘는다.
+    """
+    blocks = []
+    for i, h in enumerate(hits, 1):
+        피심인 = ", ".join(getattr(h, "피심인", []) or [])
+        위반 = ", ".join(getattr(h, "위반유형", []) or [])
+        조치 = ", ".join(getattr(h, "조치유형", []) or [])
+        text = getattr(h, "text", "") or ""
+        if len(text) > max_text_chars:
+            text = text[:max_text_chars] + "…"
+        blocks.append(
+            f"--- 의결서 {i} ---\n"
+            f"제목: {getattr(h, 'title', '')}\n"
+            f"섹션: {getattr(h, 'section', '')}\n"
+            f"피심인: {피심인}\n위반유형: {위반}\n조치유형: {조치}\n"
+            f"본문:\n{text}\n"
+        )
+    return "\n".join(blocks)
+
+
+# ───────────────────────── llama-cpp 백엔드 ─────────────────────────
+
+@dataclass
+class LlamaConfig:
+    gguf_path: str
+    n_ctx:    int = 4096
+    n_threads: int | None = None
+    max_tokens: int = 800
+    temperature: float = 0.2
+    n_gpu_layers: int = -1   # -1 = 모든 레이어를 GPU 오프로드 (CUDA wheel 시)
+
+
+_LLAMA_LOCK = threading.Lock()
+_LLAMA_INSTANCE = None
+
+
+def _get_llama(cfg: LlamaConfig):
+    """프로세스당 단일 인스턴스 (모델 로드는 무겁다)."""
+    global _LLAMA_INSTANCE
+    if _LLAMA_INSTANCE is not None:
+        return _LLAMA_INSTANCE
+    with _LLAMA_LOCK:
+        if _LLAMA_INSTANCE is None:
+            from llama_cpp import Llama, llama_supports_gpu_offload
+            gpu_ok = bool(llama_supports_gpu_offload())
+            _LLAMA_INSTANCE = Llama(
+                model_path=cfg.gguf_path,
+                n_ctx=cfg.n_ctx,
+                n_threads=cfg.n_threads or os.cpu_count() or 4,
+                n_gpu_layers=cfg.n_gpu_layers if gpu_ok else 0,
+                verbose=False,
+            )
+    return _LLAMA_INSTANCE
+
+
+def _load_config_from_env() -> LlamaConfig:
+    gguf = os.environ.get("LLM_GGUF_PATH", "").strip()
+    if not gguf:
+        # 자동 탐색 — _PREFERRED_MODEL_PATTERNS 순서로 우선 탐색 (EXAONE 한국어 SOTA)
+        all_gguf = sorted(Path("models/llm").glob("*.gguf"))
+        for pat in _PREFERRED_MODEL_PATTERNS:
+            for cand in all_gguf:
+                if pat in cand.name.lower():
+                    gguf = str(cand)
+                    break
+            if gguf:
+                break
+        if not gguf and all_gguf:
+            gguf = str(all_gguf[0])
+    if not gguf or not Path(gguf).exists():
+        raise RuntimeError(
+            "GGUF 모델 파일을 찾지 못했습니다. "
+            "LLM_GGUF_PATH 환경변수 또는 models/llm/*.gguf 배치.")
+    return LlamaConfig(
+        gguf_path=gguf,
+        n_ctx=int(os.environ.get("LLM_N_CTX", "4096")),
+        n_threads=(int(os.environ["LLM_N_THREADS"])
+                   if os.environ.get("LLM_N_THREADS") else None),
+        max_tokens=int(os.environ.get("LLM_MAX_TOKENS", "800")),
+        temperature=float(os.environ.get("LLM_TEMPERATURE", "0.2")),
+        n_gpu_layers=int(os.environ.get("LLM_N_GPU_LAYERS", "-1")),
+    )
+
+
+_HYDE_SYSTEM = """공정거래위원회 의결서 답변 생성기 (HyDE).
+질문에 대해 의결서 본문에 등장할 법한 가상의 1-2문장 답변을 한국어로 생성.
+답변은 의결서 형식 (피심인, 행위, 법조항, 처분 키워드 포함). 100자 이내."""
+
+_HYDE_USER = """질문: {query}
+
+위 질문에 대해 공정위 의결서가 답변할 법한 가상의 답변 1-2문장:"""
+
+
+def generate_hypothetical(query: str, max_tokens: int = 80) -> str:
+    """HyDE: 가상의 답변을 생성하여 dense 검색 쿼리로 사용.
+    검색 정확도 향상 (의미적 매칭 강화) — vague 쿼리에 효과적.
+    """
+    cfg = _load_config_from_env()
+    llm = _get_llama(cfg)
+    out = llm.create_chat_completion(
+        messages=[
+            {"role": "system", "content": _HYDE_SYSTEM},
+            {"role": "user", "content": _HYDE_USER.format(query=query)},
+        ],
+        max_tokens=max_tokens,
+        temperature=0.3,
+    )
+    return out["choices"][0]["message"]["content"].strip()
+
+
+def generate_hypothetical_multi(query: str, n: int = 3, max_tokens: int = 80) -> list[str]:
+    """Multi-query HyDE: 다른 temperature/seed 로 가상 답변 N개 생성 → RRF 다양성 ↑.
+    각 답변이 서로 다른 의미 측면을 담아 검색 결과 fusion 시 보완 효과.
+    """
+    cfg = _load_config_from_env()
+    llm = _get_llama(cfg)
+    results = []
+    temperatures = [0.3, 0.5, 0.7][:n]
+    for temp in temperatures:
+        try:
+            out = llm.create_chat_completion(
+                messages=[
+                    {"role": "system", "content": _HYDE_SYSTEM},
+                    {"role": "user", "content": _HYDE_USER.format(query=query)},
+                ],
+                max_tokens=max_tokens,
+                temperature=temp,
+                seed=int(temp * 1000),
+            )
+            text = out["choices"][0]["message"]["content"].strip()
+            if text and text not in results:
+                results.append(text)
+        except Exception:
+            pass
+    return results
+
+
+def generate(query: str, hits: list, deadline_sec: float = 18.0) -> str:
+    """
+    로컬 LLM 으로 답변 생성. 모든 호출은 동일 인스턴스 사용 (모델 재로드 X).
+    deadline_sec: 30 초 한도에서 안전 마진 5초.
+
+    n_ctx 초과 시 자동으로 chunk text 를 점차 줄여 재시도 (최대 3회).
+    """
+    cfg = _load_config_from_env()
+    llm = _get_llama(cfg)
+
+    chars_budget = 350  # format_context 기본값
+    last_err: Exception | None = None
+    for attempt in range(3):
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",
+             "content": USER_PROMPT_TEMPLATE.format(
+                 query=query,
+                 context=format_context(hits, max_text_chars=chars_budget))},
+        ]
+        try:
+            out = llm.create_chat_completion(
+                messages=messages,
+                max_tokens=cfg.max_tokens,
+                temperature=cfg.temperature,
+            )
+            return out["choices"][0]["message"]["content"]
+        except ValueError as e:
+            # llama-cpp 의 "Requested tokens (X) exceed context window of Y" 처리
+            msg = str(e)
+            if "exceed context window" not in msg:
+                raise
+            last_err = e
+            chars_budget = max(120, chars_budget // 2)  # 절반으로 축소
+    # 마지막에도 실패 — 컨텍스트 없이 query 만으로 시도
+    try:
+        out = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",
+                 "content": f"질문: {query}\n\n[참고 의결서 누락 — 자료 부족]"},
+            ],
+            max_tokens=80,
+            temperature=cfg.temperature,
+        )
+        return out["choices"][0]["message"]["content"]
+    except Exception:
+        raise last_err if last_err else RuntimeError("LLM 호출 실패 (알 수 없는 이유)")
+
+
+def is_available() -> bool:
+    """기동 시 LLM 로드 가능 여부 확인 (체크용, 실제 로드는 첫 generate 에서)."""
+    try:
+        _ = _load_config_from_env()
+        return True
+    except Exception:
+        return False

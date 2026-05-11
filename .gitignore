@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# 인덱스·데이터 (크기 큼)
+data/
+index/
+index_official/
+index_dense_*/
+*.jsonl
+
+# 모델 바이너리 (수 GB)
+models/
+*.gguf
+*.onnx
+*.pkl
+*.bin
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Claude Code
+.claude/

@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>공정거래 의결서 AI · KFTC RAG</title>
+    <meta name="description" content="공정거래위원회 의결서 31,877개를 자연어로 검색하는 한국어 특화 RAG. Qwen2.5-7B + Hybrid Retrieval + HyDE.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css?v=3">
+</head>
+<body>
+    <!-- ──────────── Top Bar ──────────── -->
+    <header class="topbar">
+        <div class="topbar-inner">
+            <a href="/" class="brand" aria-label="홈">
+                <span class="brand-mark" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12 3v18M5 8l7-5 7 5M3 21h18"/>
+                        <path d="M5 8v3a4 4 0 1 0 7 0V8M12 8v3a4 4 0 1 0 7 0V8"/>
+                    </svg>
+                </span>
+                <div class="brand-text">
+                    <strong>KFTC AI</strong>
+                    <small>의결서 자연어 검색</small>
+                </div>
+            </a>
+            <div class="topbar-actions">
+                <div class="status" id="status">
+                    <span class="status-dot" id="statusDot"></span>
+                    <span id="statusText">연결 중</span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- ──────────── Hero (centered, minimal) ──────────── -->
+    <section class="hero">
+        <div class="hero-inner">
+            <span class="eyebrow">제2회 공정거래 AI·데이터 활용 공모전 · 트랙2</span>
+            <h1 class="hero-title">의결서를 자연어로 묻고,<br><span class="hero-accent">근거로 받습니다.</span></h1>
+            <p class="hero-sub">공정거래위원회 의결서를 BM25 + Dense + Cross-Encoder 3단 검색으로 정확히 찾고, 본문에서만 발췌해 답변합니다.</p>
+        </div>
+        <div class="hero-grid" aria-hidden="true"></div>
+    </section>
+
+    <!-- ──────────── Main ──────────── -->
+    <main class="container">
+        <!-- Search -->
+        <section class="search-card" aria-label="검색">
+            <div class="query-wrap">
+                <textarea id="query" class="query-box" rows="3"
+                    placeholder="예) 가맹본부가 가맹점주에게 특정 물품을 구매하라고 요구하는 건 위법인가요?"></textarea>
+            </div>
+
+            <div class="actions-row">
+                <details class="advanced">
+                    <summary>
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                        <span>옵션</span>
+                    </summary>
+                    <div class="controls">
+                        <div class="control-group">
+                            <label for="topK">표시 개수</label>
+                            <div class="range-row">
+                                <input type="range" id="topK" min="1" max="10" value="5">
+                                <span class="range-value" id="topKValue">5</span>
+                            </div>
+                        </div>
+                        <div class="control-group">
+                            <label for="filterViolation">위반유형</label>
+                            <input type="text" id="filterViolation" placeholder="예: 가맹사업법">
+                        </div>
+                        <div class="control-group">
+                            <label for="filterSanction">조치유형</label>
+                            <input type="text" id="filterSanction" placeholder="예: 과징금">
+                        </div>
+                    </div>
+                </details>
+
+                <div class="actions">
+                    <button id="searchBtn" class="btn btn-secondary" type="button">검색만</button>
+                    <button id="answerBtn" class="btn btn-primary" type="button">
+                        <span>답변 받기</span>
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+                    </button>
+                </div>
+            </div>
+
+            <div class="examples">
+                <button class="chip" data-q="다단계판매업자 등록을 안 하면 어떤 처벌을 받나요?">다단계 미등록</button>
+                <button class="chip" data-q="프랜차이즈 본사가 가맹점주에게 특정 물품 구매를 강요하면 위법인가요?">가맹 구입강제</button>
+                <button class="chip" data-q="허위·과장 광고로 처벌받은 사례가 있나요?">허위·과장 광고</button>
+                <button class="chip" data-q="가격 담합 사건의 과징금은 얼마나 부과되나요?">가격 담합 과징금</button>
+                <button class="chip" data-q="하도급 단가를 일률적으로 인하한 건 어떤 처분을 받나요?">하도급 단가 인하</button>
+            </div>
+        </section>
+
+        <section id="loading" class="loading hidden" aria-live="polite">
+            <div class="spinner"></div>
+            <span id="loadingText">검색 중</span>
+        </section>
+
+        <section id="error" class="error hidden" aria-live="assertive"></section>
+
+        <section id="answer" class="result-card answer-card hidden">
+            <div class="card-header">
+                <h2>답변</h2>
+                <span class="meta" id="answerMeta"></span>
+            </div>
+            <div class="answer-body" id="answerBody"></div>
+        </section>
+
+        <section id="sources" class="result-card sources-card hidden">
+            <div class="card-header">
+                <h2>참고 의결서</h2>
+                <span class="meta" id="sourcesMeta"></span>
+            </div>
+            <div id="sourcesList"></div>
+        </section>
+    </main>
+
+    <footer class="footer">
+        <div class="footer-inner">
+            <span class="footer-stack">BM25 · mpnet · Jina-Reranker · HyDE · Qwen2.5-7B</span>
+            <span class="footer-sep">·</span>
+            <a href="/docs" target="_blank" rel="noopener">API</a>
+            <span class="footer-sep">·</span>
+            <a href="/health" target="_blank" rel="noopener">상태</a>
+        </div>
+    </footer>
+
+    <script src="/static/app.js?v=3"></script>
+</body>
+</html>
