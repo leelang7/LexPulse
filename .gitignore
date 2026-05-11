@@ -31,3 +31,11 @@ Thumbs.db
 
 # Claude Code
 .claude/
+
+# 문서 기획서
+*.md
+*.pdf
+*.hwpx
+*.docx
+*.xlsx
+*.csv
