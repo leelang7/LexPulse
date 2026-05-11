@@ -32,6 +32,11 @@ Thumbs.db
 # Claude Code
 .claude/
 
+# 성능 평가
+eval_*.py
+smoke_test.py
+src/eval_*.py
+
 # 문서 기획서
 *.md
 *.pdf
