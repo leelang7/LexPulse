@@ -135,6 +135,33 @@ class LiteRetriever:
         # chunk_id → index 매핑 (검증용)
         self.chunk_id_set: set[str] = {c["chunk_id"] for c in self.chunks}
 
+        # ── Doc-level BM25 (문서 전체 텍스트 기반 — 더 정확한 문서 식별) ──
+        # 500 의결서 × 평균 64 청크 → 각 문서의 청크 텍스트를 합산하여
+        # 청크 단위보다 풍부한 컨텍스트로 문서를 대표. BM25 RRF 추가 신호.
+        from collections import defaultdict as _dd
+        _doc2texts: dict[str, list[str]] = _dd(list)
+        _doc2idx: dict[str, int] = {}
+        for c in self.chunks:
+            _doc2texts[c["doc_id"]].append(c["text"])
+        self._doc_ids_ordered: list[str] = list(_doc2texts.keys())
+        _doc_corpus: list[list[str]] = []
+        for d in self._doc_ids_ordered:
+            texts = _doc2texts[d]
+            # 피심인·위반유형 메타 + 첫 N청크 텍스트 (5000자 상한)
+            meta_c = self.chunks[next(
+                i for i, c in enumerate(self.chunks) if c["doc_id"] == d)]
+            피심인_str = " ".join(meta_c.get("피심인", []))
+            위반_str   = " ".join(meta_c.get("위반유형", []))
+            title_str  = meta_c.get("title", "")
+            body = " ".join(texts)[:5000]
+            full = f"{title_str} {피심인_str} {위반_str} {body}"
+            _doc_corpus.append(korean_tokenize(full))
+        self._doc_bm25 = BM25Okapi(_doc_corpus)
+        self._doc_id_to_ordinal: dict[str, int] = {
+            d: i for i, d in enumerate(self._doc_ids_ordered)
+        }
+        log.info("Doc-level BM25 구축 완료: %d 문서", len(self._doc_ids_ordered))
+
         # Dense (fastembed 또는 sentence-transformers) — 선택적
         self.dense_index = None
         self.dense_embedder = None
@@ -235,7 +262,9 @@ class LiteRetriever:
                doc_diversity: bool = False,
                hyde_text: Optional[str] = None,
                hyde_texts: Optional[list[str]] = None,
-               doc_aggregate: bool = False) -> list[LiteHit]:
+               doc_aggregate: bool = False,
+               top_doc_expand: bool = False,
+               query_variants: Optional[list[str]] = None) -> list[LiteHit]:
         """
         Hybrid search + doc-level boost.
 
@@ -243,8 +272,15 @@ class LiteRetriever:
                    +doc_boost / (k+rank) 가산. doc-level Recall 향상.
         """
         import numpy as np
-        # 1) BM25
-        bm25_scores = self.bm25.get_scores(korean_tokenize(query))
+        # 1) Multi-query BM25 (max fusion): 원본 쿼리 + legal 변형쿼리 max 점수
+        all_bm25_queries = [query] + (query_variants or [])
+        if len(all_bm25_queries) == 1:
+            bm25_scores = self.bm25.get_scores(korean_tokenize(query))
+        else:
+            bm25_scores = np.zeros(len(self.chunks), dtype=np.float32)
+            for q in all_bm25_queries:
+                s = self.bm25.get_scores(korean_tokenize(q))
+                bm25_scores = np.maximum(bm25_scores, s)
         bm25_order = list(np.argsort(bm25_scores)[::-1][:candidate_k])
         bm25_rank_map = {idx: r for r, idx in enumerate(bm25_order)
                           if bm25_scores[idx] > 0}
@@ -273,7 +309,7 @@ class LiteRetriever:
         # 후방호환: 기존 hyde_hits 변수 유지 (이후 RRF 단일 분기와 일치)
         hyde_hits = all_hyde_hits[0] if all_hyde_hits else []
 
-        # 3) RRF (k=60) — BM25 + Dense + (HyDE-Dense)
+        # 3) RRF (k=60) — BM25-chunk + Dense + HyDE-Dense + Doc-level-BM25
         from collections import defaultdict
         rrf: dict[int, float] = defaultdict(float)
         for r, idx in enumerate(bm25_order):
@@ -281,10 +317,24 @@ class LiteRetriever:
                 rrf[idx] += 1.0 / (60 + r + 1)
         for r, (idx, _) in enumerate(dense_hits):
             rrf[idx] += 1.0 / (60 + r + 1)
-        # multi-HyDE: 모든 HyDE dense 결과에 대해 RRF 가산 (각각 독립 ranking)
+        # multi-HyDE: 모든 HyDE dense 결과에 대해 RRF 가산
         for hh in all_hyde_hits:
             for r, (idx, _) in enumerate(hh):
                 rrf[idx] += 1.0 / (60 + r + 1)
+
+        # Doc-level BM25: chunk RRF 합산 후 doc 점수를 doc-BM25 로 보정
+        # (RRF 직접 추가 대신, doc 집계 단계에서 가중치로 사용)
+        _doc_bm25_scores: dict[str, float] = {}
+        if hasattr(self, "_doc_bm25"):
+            _all_q = [query] + (query_variants or [])
+            _dbm25 = self._doc_bm25.get_scores(korean_tokenize(_all_q[0]))
+            for _q in _all_q[1:]:
+                import numpy as _np2
+                _dbm25 = _np2.maximum(_dbm25, self._doc_bm25.get_scores(korean_tokenize(_q)))
+            _max_d = float(max(_dbm25.max(), 1e-9))
+            for _i, _d in enumerate(self._doc_ids_ordered):
+                if _dbm25[_i] > 0:
+                    _doc_bm25_scores[_d] = float(_dbm25[_i]) / _max_d
 
         # 4) doc-level boost: 한 doc 에서 여러 chunk 매칭 → 해당 doc 청크 가산
         if doc_boost > 0:
@@ -299,18 +349,42 @@ class LiteRetriever:
         ordered = sorted(rrf.items(), key=lambda x: x[1], reverse=True)
 
         # 4b) doc_aggregate: 각 doc 의 chunk 합산 점수로 doc rank → top doc 의 best chunk
-        # gold 가 doc 전체이므로 "어떤 doc 인지"를 강하게 결정. 단일 chunk 노이즈 제거.
         if doc_aggregate:
-            doc_total: dict[str, float] = defaultdict(float)
+            doc_total_agg: dict[str, float] = defaultdict(float)
             doc_best_chunk: dict[str, tuple[int, float]] = {}
             for idx, s in rrf.items():
                 d = self.chunks[idx]["doc_id"]
-                doc_total[d] += s
+                doc_total_agg[d] += s
                 if d not in doc_best_chunk or s > doc_best_chunk[d][1]:
                     doc_best_chunk[d] = (idx, s)
-            # doc rank 후 각 doc 의 best chunk 만 ordered 로 재구성
-            doc_sorted = sorted(doc_total.items(), key=lambda x: x[1], reverse=True)
+            doc_sorted = sorted(doc_total_agg.items(), key=lambda x: x[1], reverse=True)
             ordered = [(doc_best_chunk[d][0], score) for d, score in doc_sorted]
+
+        # 4c) top_doc_expand: doc-BM25 로 보정된 doc 점수로 상위 doc 청크 확장.
+        if top_doc_expand:
+            doc_total_exp: dict[str, float] = defaultdict(float)
+            doc_chunks_map: dict[str, list[tuple[int, float]]] = defaultdict(list)
+            for idx, s in rrf.items():
+                d = self.chunks[idx]["doc_id"]
+                # doc-level BM25 가중치로 보정 (1 + 정규화 점수)
+                boost = 1.0 + _doc_bm25_scores.get(d, 0.0) * 0.5
+                doc_total_exp[d] += s * boost
+                doc_chunks_map[d].append((idx, s))
+            if doc_total_exp:
+                sorted_docs = sorted(doc_total_exp, key=lambda d: doc_total_exp[d],
+                                     reverse=True)
+                s1 = doc_total_exp[sorted_docs[0]]
+                s2 = doc_total_exp[sorted_docs[1]] if len(sorted_docs) > 1 else 0.0
+                ratio = s1 / (s1 + s2 + 1e-9)
+                n1 = top_k if (ratio >= 0.60 or len(sorted_docs) == 1) else \
+                     (top_k - 1 if ratio >= 0.52 else top_k - 2)
+                exp_ordered: list[tuple[int, float]] = []
+                exp_ordered.extend(sorted(doc_chunks_map[sorted_docs[0]],
+                                          key=lambda x: x[1], reverse=True)[:n1])
+                if n1 < top_k and len(sorted_docs) > 1:
+                    exp_ordered.extend(sorted(doc_chunks_map[sorted_docs[1]],
+                                              key=lambda x: x[1], reverse=True)[:top_k - n1])
+                ordered = exp_ordered
 
         # 5) 필터링 후 reranker 후보군 형성
         filtered: list[tuple[int, float]] = []
@@ -389,6 +463,76 @@ class SearchResponse(BaseModel):
     hits: list[SearchHit]
 
 
+# ───────────────────────── 위반유형 추출 (쿼리 → 필터) ─────────────────────────
+
+def _normalize_viol(s: str) -> str:
+    """정규화: 공백·특수문자 제거, 소문자."""
+    return re.sub(r'[\s\-·\.「」\(\)/]+', '', s).lower()
+
+
+def _extract_violation_type(query: str,
+                            known_violations: list[str]) -> str | None:
+    """쿼리 텍스트에서 위반유형 추출 (정규화 substring 매칭).
+    매칭된 위반유형 중 가장 긴 것 반환 (최소 5자).
+    """
+    qnorm = _normalize_viol(query)
+    best: str | None = None
+    best_len = 4   # 최소 매칭 길이
+    for v in known_violations:
+        vnorm = _normalize_viol(v)
+        if len(vnorm) >= best_len and vnorm in qnorm:
+            if len(vnorm) > best_len:
+                best_len = len(vnorm)
+                best = v
+    return best
+
+
+def _search_with_viol_filter(
+        r: "LiteRetriever",
+        question: str,
+        known_violations: list[str],
+        *,
+        hyde_text: str | None = None,
+        hyde_texts: list[str] | None = None,
+        query_variants: list[str] | None = None,
+        candidate_k: int = 50,
+        rerank_topn: int = 30,
+) -> list[LiteHit]:
+    """위반유형 필터 우선 검색. 필터 결과 부족 시 무필터로 보충."""
+    extracted = _extract_violation_type(question, known_violations)
+    filter_viol = [extracted] if extracted else None
+
+    hits = r.search(
+        question, top_k=5,
+        doc_diversity=True,
+        candidate_k=candidate_k,
+        rerank_topn=rerank_topn,
+        hyde_text=hyde_text,
+        hyde_texts=hyde_texts,
+        query_variants=query_variants or [],
+        filter_위반유형=filter_viol,
+    )
+
+    # 필터 결과가 5개 미만 → 무필터 검색으로 보충
+    if len(hits) < 5:
+        already = {h.chunk_id for h in hits}
+        fallback = r.search(
+            question, top_k=5,
+            doc_diversity=True,
+            candidate_k=candidate_k,
+            rerank_topn=rerank_topn,
+            hyde_text=hyde_text,
+        )
+        for h in fallback:
+            if h.chunk_id not in already:
+                hits.append(h)
+                already.add(h.chunk_id)
+                if len(hits) >= 5:
+                    break
+
+    return hits
+
+
 class AnswerRequest(SearchRequest):
     """provider 필드 제거: 외부 API 금지로 로컬 LLM 만 사용."""
 
@@ -463,6 +607,12 @@ async def lifespan(_app: FastAPI):
                                 reranker_model=RERANKER_MODEL or None)
     log.info("청크 %d개 로드, %.2fs", len(retriever.chunks), time.perf_counter() - t0)
     _state["retriever"] = retriever
+    # 위반유형 전체 목록 (쿼리 필터링에 사용)
+    all_viols: set[str] = set()
+    for c in retriever.chunks:
+        all_viols.update(c.get("위반유형", []))
+    _state["all_violations"] = sorted(all_viols, key=len, reverse=True)  # 긴 것 우선
+    log.info("위반유형 %d종 로드", len(_state["all_violations"]))
 
     # 로컬 LLM 가용성 확인 (실제 로드는 첫 호출에서 lazy)
     try:
@@ -569,20 +719,22 @@ def search(req: SearchRequest):
     """검색 only — /predict 와 동일 retrieval 설정 (doc_diversity, 50/30)."""
     r = _retriever()
     t0 = time.perf_counter()
+    # HyDE: 실험 결과 retrieval 노이즈 추가 → 비활성 (위반유형 필터로 대체)
     hyde_text = None
-    if os.environ.get("USE_HYDE", "0") == "1" and _state.get("llm_loaded"):
-        try:
-            from local_llm import generate_hypothetical
-            hyde_text = generate_hypothetical(req.query, max_tokens=80)
-        except Exception as e:
-            log.warning("HyDE 실패: %s", e)
-    hits = r.search(req.query, top_k=req.top_k,
-                    filter_조치유형=req.filter_조치유형,
-                    filter_위반유형=req.filter_위반유형,
-                    doc_diversity=True,
-                    candidate_k=50, rerank_topn=30,
-                    hyde_text=hyde_text,
-                    doc_aggregate=(os.environ.get("DOC_AGGREGATE","0")=="1"))
+    known_viols = _state.get("all_violations", [])
+    if req.filter_위반유형 or req.filter_조치유형:
+        # 사용자가 직접 필터 지정 시 그대로 사용
+        hits = r.search(req.query, top_k=req.top_k,
+                        filter_조치유형=req.filter_조치유형,
+                        filter_위반유형=req.filter_위반유형,
+                        doc_diversity=True, candidate_k=50, rerank_topn=30,
+                        hyde_text=hyde_text)
+    else:
+        # 위반유형 자동 추출 필터 + 무필터 보충
+        hits = _search_with_viol_filter(
+            r, req.query, known_viols,
+            hyde_text=hyde_text, candidate_k=50, rerank_topn=30)
+    hits = hits[:req.top_k]
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
     log.info("[search] q=%r → %d hits (%.0f ms)",
              req.query[:50], len(hits), elapsed_ms)
@@ -641,28 +793,21 @@ def predict(req: PredictRequest):
     if not question:
         raise HTTPException(422, "'question' 또는 'query' 필드 필요")
 
-    # 1) HyDE: Qwen 으로 가상 답변 생성 → dense 검색에 보강
-    # USE_HYDE_MULTI=1 → 가상 답변 N개 (default 3) 생성 → 각각 dense 검색 → RRF fusion
+    # HyDE 비활성 (실험 결과 retrieval 노이즈 → 성능 저하 확인)
     hyde_text = None
     hyde_texts = None
-    if _state.get("llm_loaded"):
-        try:
-            n_hyde = int(os.environ.get("HYDE_N", "1"))
-            if n_hyde >= 2 and os.environ.get("USE_HYDE_MULTI", "0") == "1":
-                from local_llm import generate_hypothetical_multi
-                hyde_texts = generate_hypothetical_multi(question, n=n_hyde, max_tokens=80)
-            elif os.environ.get("USE_HYDE", "0") == "1":
-                from local_llm import generate_hypothetical
-                hyde_text = generate_hypothetical(question, max_tokens=80)
-        except Exception as e:
-            log.warning("HyDE 실패 (BM25+Dense 만 사용): %s", e)
+    query_variants: list[str] = []
 
-    # 2) Top-5 retrieval (best config: 50/30, doc_diversity)
-    hits = r.search(question, top_k=5, doc_diversity=True,
-                    candidate_k=50, rerank_topn=30,
-                    hyde_text=hyde_text,
-                    hyde_texts=hyde_texts,
-                    doc_aggregate=(os.environ.get("DOC_AGGREGATE","0")=="1"))
+    # 2) 위반유형 자동 추출 필터 + HyDE + 무필터 보충
+    known_viols = _state.get("all_violations", [])
+    hits = _search_with_viol_filter(
+        r, question, known_viols,
+        hyde_text=hyde_text,
+        hyde_texts=hyde_texts,
+        query_variants=query_variants,
+        candidate_k=50,
+        rerank_topn=30,
+    )
     if len(hits) < 5:
         # 부족한 경우 BM25 점수 무관하게 다음 후보로 채움 (corpus 전체에서)
         already = {h.chunk_id for h in hits}

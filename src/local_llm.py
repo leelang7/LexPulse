@@ -56,28 +56,25 @@ def _add_nvidia_dll_dirs() -> None:
 _add_nvidia_dll_dirs()
 
 
-SYSTEM_PROMPT = """당신은 공정거래위원회 의결서 발췌기다. 반드시 한국어로만 답변한다.
+SYSTEM_PROMPT = """당신은 공정거래위원회 의결서 핵심 사실 추출기다. 반드시 한국어로만 답변한다.
 
 규칙:
-1. **답변은 오직 [참고 의결서] 본문에서만 발췌·인용**한다. 본문 외 사실 추측·창작 금지.
-2. **우선순위: 같은 사건의 "주문/처분/결론" 본문**을 먼저 발췌하고,
-   필요하면 "위법성판단/기초사실" 본문을 보충한다.
-3. 답변에 다음을 가능한 모두 포함 (모두 [참고 의결서] 본문 발췌로):
-   - 위반 행위 요지
-   - 적용 법조항 (예: 법 제○조 제○항)
-   - 처분 내용 (시정명령 / 과징금 / 고발 / 과징금 액수)
-4. 답변은 첫 번째로 등장하는 의결서(가장 관련 있는 사건)에 집중. 다른 의결서로 헷갈리지 않는다.
-5. 답변 본문 800자 이내. 발췌 길게 — 위반행위·법조항·처분 모두 포함. 마지막 줄에 "[의결서: 사건명]" 1회 인용.
-6. 영어·중국어·일본어 절대 금지. 100% 한국어.
-7. **[참고 의결서]에서 질문에 대한 명확한 근거를 찾을 수 없으면**
-   "관련 의결서에서 확인되지 않습니다" 한 줄만 출력. 추측·일반론 금지.
+1. **오직 [참고 의결서] 본문에서만 발췌·인용** — 추측·창작·일반론 금지.
+2. 다음 항목을 불릿 포인트(-)로 추출:
+   - 피심인: (사업자명)
+   - 위반행위: (무엇을 했는가, 원문 발췌)
+   - 법조항: (법 제○조 제○항)
+   - 처분: (시정명령/과징금 OO원/고발 등 원문 발췌)
+3. 주문·처분 섹션을 우선 참조. 기초사실·위법성판단 보충.
+4. 근거 없으면 "관련 의결서에서 확인되지 않습니다" 1줄만 출력.
+5. 한국어만. 500자 이내.
 """
 
-# 모델 우선순위 (사용자 정책: Qwen2.5-7B-Instruct 우선)
+# 모델 우선순위 (경쟁 최고 성능 목표: EXAONE 한국어 SOTA → BERTScore/F1 최적화)
 _PREFERRED_MODEL_PATTERNS = [
-    "qwen2.5",   # Qwen2.5 7B 우선 (사용자 지정)
-    "qwen",      # Qwen 계열 일반
-    "exaone",    # 한국어 SOTA backup
+    "exaone",    # LG AI Research 한국어 SOTA — BERTScore/F1 최적화
+    "qwen2.5",   # Qwen2.5 7B 다국어 고성능
+    "qwen",
     "mistral",
     "gemma",
 ]
@@ -87,33 +84,47 @@ USER_PROMPT_TEMPLATE = """질문: {query}
 [참고 의결서]
 {context}
 
-가장 관련 있는 의결서의 "주문/처분/결론" 본문에서 다음을 원문 그대로 발췌:
-- 위반행위 요지 (피심인이 무엇을 했는가)
-- 적용 법조항 (법 제○조 제○항)
-- 처분 내용 (시정명령/과징금 액수/고발 등)
-한국어로 800자 이내로 답하되, 가능한 한 본문 표현을 길게 인용하십시오. 의역 금지.
+위 의결서 본문에서 질문 관련 사실을 불릿 포인트로 발췌하라:
+- 피심인:
+- 위반행위:
+- 법조항:
+- 처분:
 """
 
 
-def format_context(hits: list, max_text_chars: int = 350) -> str:
+# 섹션 우선순위 (주문/처분 → 위법성판단 → 기초사실 순)
+_SECTION_PRIORITY = {"주문": 0, "처분": 1, "결론": 2, "위법성판단": 3, "기초사실": 4}
+
+
+def format_context(hits: list, max_text_chars: int = 400) -> str:
     """
-    LLM 컨텍스트 빌드. 각 청크 본문을 max_text_chars 로 잘라 컨텍스트 윈도우 보호.
-    공식 데이터의 일부 청크는 매우 길어 5개를 합치면 4096 토큰을 넘는다.
+    LLM 컨텍스트 빌드.
+    - 동일 doc 청크라면 섹션 우선순위(주문>처분>위법성판단>기초사실) 로 정렬.
+    - 각 청크 본문을 max_text_chars 로 잘라 컨텍스트 윈도우 보호.
     """
+    doc_ids = set(getattr(h, "doc_id", "") for h in hits)
+    if len(doc_ids) == 1:
+        # 같은 문서 청크 → 섹션 우선순위 정렬 (주문/처분 본문 앞에 오게)
+        hits_sorted = sorted(
+            hits,
+            key=lambda h: _SECTION_PRIORITY.get(getattr(h, "section", ""), 99)
+        )
+    else:
+        hits_sorted = hits
+
     blocks = []
-    for i, h in enumerate(hits, 1):
+    for i, h in enumerate(hits_sorted, 1):
         피심인 = ", ".join(getattr(h, "피심인", []) or [])
         위반 = ", ".join(getattr(h, "위반유형", []) or [])
         조치 = ", ".join(getattr(h, "조치유형", []) or [])
         text = getattr(h, "text", "") or ""
         if len(text) > max_text_chars:
             text = text[:max_text_chars] + "…"
+        section = getattr(h, "section", "")
         blocks.append(
-            f"--- 의결서 {i} ---\n"
-            f"제목: {getattr(h, 'title', '')}\n"
-            f"섹션: {getattr(h, 'section', '')}\n"
-            f"피심인: {피심인}\n위반유형: {위반}\n조치유형: {조치}\n"
-            f"본문:\n{text}\n"
+            f"--- [{section}] {getattr(h, 'title', '')} ---\n"
+            f"피심인: {피심인} | 위반: {위반} | 조치: {조치}\n"
+            f"{text}\n"
         )
     return "\n".join(blocks)
 
@@ -182,16 +193,18 @@ def _load_config_from_env() -> LlamaConfig:
     )
 
 
-_HYDE_SYSTEM = """공정거래위원회 의결서 답변 생성기 (HyDE).
-질문에 대해 의결서 본문에 등장할 법한 가상의 1-2문장 답변을 한국어로 생성.
-답변은 의결서 형식 (피심인, 행위, 법조항, 처분 키워드 포함). 100자 이내."""
+_HYDE_SYSTEM = """공정거래위원회 의결서 검색 전문가.
+질문에 답하는 의결서 본문 핵심 문장을 60자 이내로 생성. 피심인명·위반행위·법조항·처분 포함. 한국어만."""
 
-_HYDE_USER = """질문: {query}
+_HYDE_USER = "질문: {query}\n의결서 핵심 내용 (60자 이내):"
 
-위 질문에 대해 공정위 의결서가 답변할 법한 가상의 답변 1-2문장:"""
+_VARIANT_SYSTEM = """공정거래법 전문가. 주어진 질문을 의결서 검색에 유리한 법률 용어로 바꿔 표현하라.
+원문과 다른 표현 1개만, 20자 이내. 한국어만."""
+
+_VARIANT_USER = "질문: {query}\n법률 검색 표현:"
 
 
-def generate_hypothetical(query: str, max_tokens: int = 80) -> str:
+def generate_hypothetical(query: str, max_tokens: int = 60) -> str:
     """HyDE: 가상의 답변을 생성하여 dense 검색 쿼리로 사용.
     검색 정확도 향상 (의미적 매칭 강화) — vague 쿼리에 효과적.
     """
@@ -233,6 +246,27 @@ def generate_hypothetical_multi(query: str, n: int = 3, max_tokens: int = 80) ->
         except Exception:
             pass
     return results
+
+
+def generate_query_variants(query: str, max_tokens: int = 40) -> list[str]:
+    """BM25 멀티쿼리용 법률 용어 변형쿼리 생성 (1개).
+    원본 쿼리와 다른 법률 표현으로 BM25 max-fusion → 추가 청크 커버.
+    """
+    try:
+        cfg = _load_config_from_env()
+        llm = _get_llama(cfg)
+        out = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": _VARIANT_SYSTEM},
+                {"role": "user",   "content": _VARIANT_USER.format(query=query)},
+            ],
+            max_tokens=max_tokens,
+            temperature=0.2,
+        )
+        variant = out["choices"][0]["message"]["content"].strip()
+        return [variant] if variant and variant != query else []
+    except Exception:
+        return []
 
 
 def generate(query: str, hits: list, deadline_sec: float = 18.0) -> str:
