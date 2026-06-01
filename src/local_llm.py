@@ -70,11 +70,11 @@ SYSTEM_PROMPT = """당신은 공정거래위원회 의결서 핵심 사실 추�
 5. 한국어만. 500자 이내.
 """
 
-# 모델 우선순위 (경쟁 최고 성능 목표: EXAONE 한국어 SOTA → BERTScore/F1 최적화)
+# 모델 우선순위
 _PREFERRED_MODEL_PATTERNS = [
-    "exaone",    # LG AI Research 한국어 SOTA — BERTScore/F1 최적화
-    "qwen2.5",   # Qwen2.5 7B 다국어 고성능
+    "qwen2.5",
     "qwen",
+    "exaone",
     "mistral",
     "gemma",
 ]
