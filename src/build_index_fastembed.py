@@ -26,6 +26,10 @@ def _add_nvidia_paths():
             binp = _Path(list(s.submodule_search_locations)[0]) / "bin"
             if binp.exists():
                 added.append(str(binp))
+                try:
+                    os.add_dll_directory(str(binp))  # Windows DLL 검색 경로 등록
+                except Exception:
+                    pass
     if added:
         os.environ["PATH"] = os.pathsep.join(added) + os.pathsep + os.environ.get("PATH", "")
 _add_nvidia_paths()
