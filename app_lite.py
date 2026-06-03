@@ -79,9 +79,10 @@ from korean_tok import korean_tokenize  # noqa: F401
 
 # ───────────────────────── 설정 ─────────────────────────
 
-INDEX_DIR    = os.environ.get("INDEX_DIR", "./index")
-DENSE_INDEX_DIR = os.environ.get("DENSE_INDEX_DIR", "")  # fastembed 인덱스 (선택)
-RERANKER_MODEL  = os.environ.get("RERANKER_MODEL", "")  # fastembed reranker 모델 ID (선택)
+INDEX_DIR     = os.environ.get("INDEX_DIR", "./index")
+DENSE_INDEX_DIR  = os.environ.get("DENSE_INDEX_DIR", "")   # 1차 dense 인덱스
+DENSE_INDEX_DIR2 = os.environ.get("DENSE_INDEX_DIR2", "")  # 2차 dense 인덱스 (앙상블 RRF)
+RERANKER_MODEL   = os.environ.get("RERANKER_MODEL", "")    # fastembed reranker
 HOST         = os.environ.get("HOST", "0.0.0.0")
 PORT         = int(os.environ.get("PORT", "8000"))
 ANSWER_DEADLINE = float(os.environ.get("ANSWER_DEADLINE_SEC", "18.0"))  # 가이드 20s 한도 마진 2초
@@ -111,6 +112,7 @@ class LiteRetriever:
     """BM25 + (선택) fastembed Dense + (선택) reranker. torch 비의존."""
 
     def __init__(self, index_dir: Path, dense_index_dir: Path | None = None,
+                 dense_index_dir2: Path | None = None,
                  reranker_model: str | None = None):
         self.index_dir = index_dir
         self.chunks: list[dict] = []
@@ -215,6 +217,35 @@ class LiteRetriever:
                 log.warning("Dense 로드 실패 (BM25-only 진행): %s", e)
                 self.dense_index = None
 
+        # ── 2차 Dense (앙상블 RRF용) ──
+        self.dense_index2 = None
+        self.dense_embedder2 = None
+        self.dense_is_e5_2 = False
+        if dense_index_dir2 and (dense_index_dir2 / "faiss.bin").exists():
+            try:
+                import faiss as _faiss2
+                self.dense_index2 = _faiss2.read_index(str(dense_index_dir2 / "faiss.bin"))
+                m2 = (dense_index_dir2 / "embedding_model.txt").read_text(encoding="utf-8").strip()
+                b2_file = dense_index_dir2 / "embedding_backend.txt"
+                b2 = b2_file.read_text(encoding="utf-8").strip() if b2_file.exists() else "fastembed"
+                self.dense_is_e5_2 = "e5" in m2.lower() and "kure" not in m2.lower()
+                if b2 == "fastembed":
+                    from fastembed import TextEmbedding as _TE2
+                    try:
+                        self.dense_embedder2 = _TE2(m2, providers=["CUDAExecutionProvider"])
+                    except Exception:
+                        self.dense_embedder2 = _TE2(m2, providers=["CPUExecutionProvider"])
+                    log.info("Dense2 로드: %s (fastembed)", m2)
+                else:
+                    from sentence_transformers import SentenceTransformer as _ST2
+                    import torch as _t2
+                    d2 = "cuda" if _t2.cuda.is_available() else "cpu"
+                    self.dense_embedder2 = _ST2(m2, device=d2)
+                    log.info("Dense2 로드: %s (sentence-transformers)", m2)
+            except Exception as e:
+                log.warning("Dense2 로드 실패 (무시): %s", e)
+                self.dense_index2 = None
+
         # Reranker (fastembed cross-encoder) — 선택적
         # CPU 강제 — EXAONE GGUF 가 GPU 점유 중일 때 다중 CUDA context 충돌 회피.
         # top-20 후보만 재랭킹하므로 CPU 도 충분히 빠름 (~0.5s).
@@ -285,10 +316,27 @@ class LiteRetriever:
         bm25_rank_map = {idx: r for r, idx in enumerate(bm25_order)
                           if bm25_scores[idx] > 0}
 
-        # 2) Dense (있을 때만) — HyDE 텍스트가 있으면 추가 dense 검색 후 fusion
+        # 2) Dense1 — 기본 dense 검색
         dense_hits = []
         if use_hybrid and self.dense_index is not None:
             dense_hits = self._dense_search(query, candidate_k)
+
+        # 2-2) Dense2 — 앙상블 RRF (두 번째 dense 모델)
+        dense_hits2: list[tuple[int, float]] = []
+        if use_hybrid and self.dense_index2 is not None and self.dense_embedder2 is not None:
+            try:
+                q2 = f"query: {query}" if self.dense_is_e5_2 else query
+                if hasattr(self.dense_embedder2, 'encode'):
+                    emb2 = self.dense_embedder2.encode(
+                        [q2], normalize_embeddings=True, convert_to_numpy=True)
+                else:
+                    emb2 = next(iter(self.dense_embedder2.embed([q2])))
+                emb2 = np.asarray(emb2, dtype=np.float32).reshape(1, -1)
+                emb2 /= (np.linalg.norm(emb2, axis=1, keepdims=True) + 1e-12)
+                scores2, ids2 = self.dense_index2.search(emb2, candidate_k)
+                dense_hits2 = [(int(i), float(s)) for i, s in zip(ids2[0], scores2[0]) if i >= 0]
+            except Exception as _e2:
+                log.warning("Dense2 검색 실패: %s", _e2)
         dense_rank_map = {idx: r for r, (idx, _) in enumerate(dense_hits)}
 
         # 2b) HyDE: 가상 답변 텍스트로 추가 dense 검색 (single 또는 multi)
@@ -309,7 +357,7 @@ class LiteRetriever:
         # 후방호환: 기존 hyde_hits 변수 유지 (이후 RRF 단일 분기와 일치)
         hyde_hits = all_hyde_hits[0] if all_hyde_hits else []
 
-        # 3) RRF (k=60) — BM25-chunk + Dense + HyDE-Dense + Doc-level-BM25
+        # 3) RRF (k=60) — BM25 + Dense1 + Dense2 + HyDE-Dense
         from collections import defaultdict
         rrf: dict[int, float] = defaultdict(float)
         for r, idx in enumerate(bm25_order):
@@ -317,7 +365,10 @@ class LiteRetriever:
                 rrf[idx] += 1.0 / (60 + r + 1)
         for r, (idx, _) in enumerate(dense_hits):
             rrf[idx] += 1.0 / (60 + r + 1)
-        # multi-HyDE: 모든 HyDE dense 결과에 대해 RRF 가산
+        # Dense2 앙상블
+        for r, (idx, _) in enumerate(dense_hits2):
+            rrf[idx] += 1.0 / (60 + r + 1)
+        # multi-HyDE
         for hh in all_hyde_hits:
             for r, (idx, _) in enumerate(hh):
                 rrf[idx] += 1.0 / (60 + r + 1)
@@ -602,9 +653,12 @@ async def lifespan(_app: FastAPI):
     if not Path(INDEX_DIR).exists():
         raise RuntimeError(f"INDEX_DIR not found: {INDEX_DIR}")
     t0 = time.perf_counter()
-    dense_dir = Path(DENSE_INDEX_DIR) if DENSE_INDEX_DIR else None
-    retriever = LiteRetriever(Path(INDEX_DIR), dense_index_dir=dense_dir,
-                                reranker_model=RERANKER_MODEL or None)
+    dense_dir  = Path(DENSE_INDEX_DIR)  if DENSE_INDEX_DIR  else None
+    dense_dir2 = Path(DENSE_INDEX_DIR2) if DENSE_INDEX_DIR2 else None
+    retriever = LiteRetriever(Path(INDEX_DIR),
+                              dense_index_dir=dense_dir,
+                              dense_index_dir2=dense_dir2,
+                              reranker_model=RERANKER_MODEL or None)
     log.info("청크 %d개 로드, %.2fs", len(retriever.chunks), time.perf_counter() - t0)
     _state["retriever"] = retriever
     # 위반유형 전체 목록 (쿼리 필터링에 사용)

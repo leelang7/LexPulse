@@ -3,8 +3,9 @@
 # Usage: .\start_lite.ps1
 
 $env:INDEX_DIR      = "./index_official"
-$env:DENSE_INDEX_DIR = "./index_dense_kure"         # KURE-v1 768→1024d 한국어 SOTA
-$env:RERANKER_MODEL  = "jinaai/jina-reranker-v2-base-multilingual"  # CPU 재랭커
+$env:DENSE_INDEX_DIR  = "./index_dense_e5large"     # 1차: e5-large 1024d (fastembed ONNX)
+$env:DENSE_INDEX_DIR2 = "./index_dense_mpnet"       # 2차: mpnet 768d (앙상블 RRF)
+$env:RERANKER_MODEL   = "jinaai/jina-reranker-v2-base-multilingual"  # CPU 재랭커
 $env:LLM_GGUF_PATH   = ""                           # 빈 값 → Qwen2.5-7B 자동 탐지
 $env:LLM_N_CTX       = "4096"
 $env:LLM_MAX_TOKENS  = "512"
