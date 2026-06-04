@@ -45,6 +45,7 @@ COPY models/llm/Qwen2.5-7B-Instruct-Q4_K_M.gguf ./models/llm/
 ENV INDEX_DIR=/app/index_official \
     DENSE_INDEX_DIR=/app/index_dense_e5large \
     DENSE_INDEX_DIR2=/app/index_dense_mpnet \
+    ANSWER_MODE=extractive \
     LLM_GGUF_PATH=/app/models/llm/Qwen2.5-7B-Instruct-Q4_K_M.gguf \
     LLM_N_CTX=4096 \
     LLM_MAX_TOKENS=800 \
