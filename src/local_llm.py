@@ -99,10 +99,28 @@ USER_PROMPT_TEMPLATE = """질문: {query}
 _SECTION_PRIORITY = {"주문": 0, "처분": 1, "결론": 2, "위법성판단": 3, "기초사실": 4}
 
 
-def format_context(hits: list, max_text_chars: int = 400) -> str:
+def _long_context_reorder(hits: list) -> list:
+    """LongContextReorder (Lost-in-the-Middle 방어).
+    입력은 관련도 내림차순. 가장 관련 높은 항목을 컨텍스트 양 끝(맨 앞/맨 뒤)에
+    배치해 LLM 이 중간에 묻힌 정답을 놓치지 않도록 재배열.
+    [1,2,3,4,5] (관련도순) -> [1,3,5,4,2] (1등 맨앞, 2등 맨뒤)
+    """
+    reordered = []
+    for i, h in enumerate(hits):
+        if i % 2 == 0:
+            reordered.append(h)       # 짝수 인덱스 → 앞쪽에 append
+        else:
+            reordered.insert(0, h)    # 홀수 인덱스 → 맨 앞에 insert (결과적으로 뒤로 밀림)
+    # 위 방식은 [1,3,5,...] 앞 + [...,4,2] 뒤 형태가 됨
+    return reordered
+
+
+def format_context(hits: list, max_text_chars: int = 400,
+                   reorder: bool = True) -> str:
     """
     LLM 컨텍스트 빌드.
     - 동일 doc 청크라면 섹션 우선순위(주문>처분>위법성판단>기초사실) 로 정렬.
+    - 서로 다른 doc 이면 LongContextReorder 로 관련도 높은 것을 양 끝에 배치.
     - 각 청크 본문을 max_text_chars 로 잘라 컨텍스트 윈도우 보호.
     """
     doc_ids = set(getattr(h, "doc_id", "") for h in hits)
@@ -112,6 +130,9 @@ def format_context(hits: list, max_text_chars: int = 400) -> str:
             hits,
             key=lambda h: _SECTION_PRIORITY.get(getattr(h, "section", ""), 99)
         )
+    elif reorder:
+        # 서로 다른 문서 → Lost-in-the-Middle 방어 재배열
+        hits_sorted = _long_context_reorder(hits)
     else:
         hits_sorted = hits
 
@@ -140,7 +161,8 @@ class LlamaConfig:
     n_ctx:    int = 4096
     n_threads: int | None = None
     max_tokens: int = 800
-    temperature: float = 0.2
+    temperature: float = 0.1   # 법률 해석 일관성·환각 차단 (단계3: 0.2→0.1)
+    top_p: float = 0.8         # 단계3: 결정적 샘플링
     n_gpu_layers: int = -1   # -1 = 모든 레이어를 GPU 오프로드 (CUDA wheel 시)
 
 
@@ -191,7 +213,8 @@ def _load_config_from_env() -> LlamaConfig:
         n_threads=(int(os.environ["LLM_N_THREADS"])
                    if os.environ.get("LLM_N_THREADS") else None),
         max_tokens=int(os.environ.get("LLM_MAX_TOKENS", "800")),
-        temperature=float(os.environ.get("LLM_TEMPERATURE", "0.2")),
+        temperature=float(os.environ.get("LLM_TEMPERATURE", "0.1")),
+        top_p=float(os.environ.get("LLM_TOP_P", "0.8")),
         n_gpu_layers=int(os.environ.get("LLM_N_GPU_LAYERS", "-1")),
     )
 
@@ -297,6 +320,7 @@ def generate(query: str, hits: list, deadline_sec: float = 18.0) -> str:
                 messages=messages,
                 max_tokens=cfg.max_tokens,
                 temperature=cfg.temperature,
+                top_p=cfg.top_p,
             )
             return out["choices"][0]["message"]["content"]
         except ValueError as e:

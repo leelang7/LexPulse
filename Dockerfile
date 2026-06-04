@@ -27,8 +27,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
 RUN python -c "from fastembed import TextEmbedding; TextEmbedding('intfloat/multilingual-e5-large')"
 # mpnet (2차 dense)
 RUN python -c "from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/paraphrase-multilingual-mpnet-base-v2')"
-# Jina Reranker
-RUN python -c "from fastembed.rerank.cross_encoder import TextCrossEncoder; TextCrossEncoder('jinaai/jina-reranker-v2-base-multilingual')"
+# Reranker 미사용: 3-way RRF가 이미 강해 역효과 (R@5 0.215->0.230, 속도 3배)
 
 # 코드
 COPY src/     ./src/
@@ -46,7 +45,6 @@ COPY models/llm/Qwen2.5-7B-Instruct-Q4_K_M.gguf ./models/llm/
 ENV INDEX_DIR=/app/index_official \
     DENSE_INDEX_DIR=/app/index_dense_e5large \
     DENSE_INDEX_DIR2=/app/index_dense_mpnet \
-    RERANKER_MODEL=jinaai/jina-reranker-v2-base-multilingual \
     LLM_GGUF_PATH=/app/models/llm/Qwen2.5-7B-Instruct-Q4_K_M.gguf \
     LLM_N_CTX=4096 \
     LLM_MAX_TOKENS=800 \

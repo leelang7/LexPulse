@@ -37,6 +37,17 @@ eval_*.py
 smoke_test.py
 src/eval_*.py
 
+# 로그·임시 산출물 (용량낭비)
+*.log
+*.txt
+!requirements*.txt
+best_weights.json
+docs/figures/
+
+# 학습 데이터·캐시 (대용량)
+pairs_official.jsonl
+retrieval_cache.pkl
+
 # 문서 기획서
 *.md
 *.pdf
